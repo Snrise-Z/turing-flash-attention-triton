@@ -18,6 +18,7 @@ DEFAULT_MODEL_PATH = (
 )
 MODEL_PATH = os.environ.get("QWEN35_MODEL_PATH", DEFAULT_MODEL_PATH)
 ATTN_IMPLEMENTATION = "xformers_memory_efficient_aligned"
+MAX_CONTEXT_TOKENS = int(os.environ.get("QWEN35_MAX_CONTEXT_TOKENS", "80000"))
 
 state: dict[str, Any] = {
     "model": None,
@@ -139,6 +140,7 @@ def health() -> dict[str, Any]:
         "ok": loaded,
         "model_path": MODEL_PATH,
         "attn_implementation": ATTN_IMPLEMENTATION,
+        "max_context_tokens": MAX_CONTEXT_TOKENS,
         "loaded_s": state["loaded_s"],
         "cuda": cuda_info,
     }
@@ -155,8 +157,25 @@ def _generate_text(request: GenerateRequest) -> dict[str, Any]:
         full_before = dict(state["full_attention_calls"])
         fla_before = dict(state["fla_calls"])
         torch.cuda.reset_peak_memory_stats()
-        inputs = tokenizer(request.prompt, return_tensors="pt").to("cuda")
+        inputs = tokenizer(request.prompt, return_tensors="pt")
         prompt_tokens = int(inputs["input_ids"].shape[-1])
+        requested_total_tokens = prompt_tokens + request.max_new_tokens
+        if requested_total_tokens > MAX_CONTEXT_TOKENS:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "context_length_exceeded",
+                    "message": (
+                        "Requested prompt_tokens + max_new_tokens exceeds "
+                        f"service max context {MAX_CONTEXT_TOKENS}"
+                    ),
+                    "prompt_tokens": prompt_tokens,
+                    "max_new_tokens": request.max_new_tokens,
+                    "requested_total_tokens": requested_total_tokens,
+                    "max_context_tokens": MAX_CONTEXT_TOKENS,
+                },
+            )
+        inputs = inputs.to("cuda")
         do_sample = request.temperature > 0
         generation_kwargs: dict[str, Any] = {
             "max_new_tokens": request.max_new_tokens,

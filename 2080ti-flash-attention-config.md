@@ -227,12 +227,15 @@ mask 支持说明：
 - GPU：通过 `CUDA_VISIBLE_DEVICES` 指定，推荐 `CUDA_VISIBLE_DEVICES=3`
 - full-attention：`xformers_memory_efficient_aligned`
 - linear-attention：模型内 FLA
+- 可用上下文：默认 `prompt_tokens + max_new_tokens <= 80000`，
+  可用 `QWEN35_MAX_CONTEXT_TOKENS` 覆盖
 - 端口：`127.0.0.1:8000`
 
 启动：
 
 ```bash
 CUDA_VISIBLE_DEVICES=3 HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   python -m uvicorn serve_qwen35_9b:app --host 127.0.0.1 --port 8000
 ```
 
@@ -240,6 +243,7 @@ CUDA_VISIBLE_DEVICES=3 HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1 \
 
 ```bash
 setsid env CUDA_VISIBLE_DEVICES=3 HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1 \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   python -m uvicorn serve_qwen35_9b:app --host 127.0.0.1 --port 8000 \
   > qwen35_server.log 2>&1 < /dev/null &
 echo $! > qwen35_server.pid
@@ -275,6 +279,18 @@ curl -fsS http://127.0.0.1:8000/v1/chat/completions \
   走 xFormers，linear-attention 走 FLA。
 - 服务每次请求前会重置 Qwen3.5 的 `rope_deltas`，避免 generation 状态污染
   后续请求。
+
+长上下文边界：
+
+- Qwen3.5-9B 配置和 tokenizer 的理论上限是 `262144` tokens。
+- 在 2080 Ti GPU3 上，服务按可用上下文 `80000` tokens 部署，
+  即 `prompt_tokens + max_new_tokens <= 80000`；超过后会在模型生成前
+  返回 HTTP 400。
+- 需要设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`，否则长上下文
+  更容易因 CUDA 内存碎片失败。
+- 已实测 `81920` 和 `82944` tokens 可完成一次短输出；`83968`、
+  `86016`、`90112` tokens 会在 FLA prefill 侧 OOM。线上服务保守取
+  `80000` tokens 作为可用上限。
 
 ### xFormers memory-efficient attention + FLA
 
