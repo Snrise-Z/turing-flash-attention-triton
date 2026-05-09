@@ -125,12 +125,13 @@ def _normalize_attention_mask(
 
 
 @triton.jit
-def _masked_prefill_attention_kernel(
+def _causal_attention_fwd_kernel(
     q,
     k,
     v,
     attention_mask,
     out,
+    logsumexp,
     sm_scale,
     q_len: tl.constexpr,
     kv_len: tl.constexpr,
@@ -141,6 +142,7 @@ def _masked_prefill_attention_kernel(
     mask_stride_h: tl.constexpr,
     mask_stride_q: tl.constexpr,
     mask_stride_k: tl.constexpr,
+    HAS_MASK: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -154,6 +156,7 @@ def _masked_prefill_attention_kernel(
     offs_n_base = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, head_dim)
     q_mask = offs_m < q_len
+    q_abs_pos = kv_len - q_len + offs_m
 
     q_offset = head_batch_idx * q_len * head_dim
     kv_offset = head_batch_idx * kv_len * head_dim
@@ -178,20 +181,22 @@ def _masked_prefill_attention_kernel(
         )
         qk = tl.dot(q_block, k_block) * qk_scale
 
-        mask_values = tl.load(
-            attention_mask
-            + batch_idx * mask_stride_b
-            + mask_head_idx * mask_stride_h
-            + offs_m[:, None] * mask_stride_q
-            + offs_n[None, :] * mask_stride_k,
-            mask=q_mask[:, None] & kv_mask[None, :],
-            other=0,
-        )
-        valid = q_mask[:, None] & kv_mask[None, :] & mask_values
+        valid = q_mask[:, None] & kv_mask[None, :] & (offs_n[None, :] <= q_abs_pos[:, None])
+        if HAS_MASK:
+            mask_values = tl.load(
+                attention_mask
+                + batch_idx * mask_stride_b
+                + mask_head_idx * mask_stride_h
+                + offs_m[:, None] * mask_stride_q
+                + offs_n[None, :] * mask_stride_k,
+                mask=q_mask[:, None] & kv_mask[None, :],
+                other=0,
+            )
+            valid = valid & mask_values
         qk = tl.where(valid, qk, -3.4028234663852886e38)
 
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-        p = tl.where(valid, tl.exp2(qk - m_ij[:, None]), 0.0)
+        p = tl.exp2(tl.where(valid, qk - m_ij[:, None], -float("inf")))
         alpha = tl.exp2(m_i - m_ij)
 
         v_block = tl.load(
@@ -210,33 +215,215 @@ def _masked_prefill_attention_kernel(
         acc,
         mask=q_mask[:, None],
     )
+    tl.store(logsumexp + head_batch_idx * q_len + offs_m, m_i + tl.log2(l_i), mask=q_mask)
 
 
-def _masked_prefill_attention(
+@triton.jit
+def _attention_bwd_delta_kernel(
+    out,
+    do,
+    delta,
+    total_q: tl.constexpr,
+    head_dim: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    offs_d = tl.arange(0, head_dim)
+    mask = row_idx < total_q
+    o = tl.load(out + row_idx * head_dim + offs_d, mask=mask, other=0.0).to(tl.float32)
+    do_block = tl.load(do + row_idx * head_dim + offs_d, mask=mask, other=0.0).to(tl.float32)
+    tl.store(delta + row_idx, tl.sum(o * do_block, axis=0), mask=mask)
+
+
+@triton.jit
+def _attention_bwd_dq_kernel(
+    q,
+    k,
+    v,
+    attention_mask,
+    do,
+    logsumexp,
+    delta,
+    dq,
+    sm_scale,
+    q_len: tl.constexpr,
+    kv_len: tl.constexpr,
+    head_dim: tl.constexpr,
+    n_heads: tl.constexpr,
+    mask_heads: tl.constexpr,
+    mask_stride_b: tl.constexpr,
+    mask_stride_h: tl.constexpr,
+    mask_stride_q: tl.constexpr,
+    mask_stride_k: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    query_idx = row_idx % q_len
+    head_batch_idx = row_idx // q_len
+    batch_idx = head_batch_idx // n_heads
+    head_idx = head_batch_idx - batch_idx * n_heads
+    mask_head_idx = tl.minimum(head_idx, mask_heads - 1)
+
+    offs_d = tl.arange(0, head_dim)
+    offs_n_base = tl.arange(0, BLOCK_N)
+    q_offset = head_batch_idx * q_len * head_dim + query_idx * head_dim
+    kv_offset = head_batch_idx * kv_len * head_dim
+    q_vec = tl.load(q + q_offset + offs_d).to(tl.float32)
+    do_vec = tl.load(do + q_offset + offs_d).to(tl.float32)
+    m_i = tl.load(logsumexp + row_idx)
+    d_i = tl.load(delta + row_idx)
+    q_abs_pos = kv_len - q_len + query_idx
+
+    dq_vec = tl.zeros((head_dim,), dtype=tl.float32)
+    qk_scale = sm_scale * 1.4426950408889634
+    for start_n in range(0, kv_len, BLOCK_N):
+        offs_n = start_n + offs_n_base
+        kv_mask = offs_n < kv_len
+        valid = kv_mask & (offs_n <= q_abs_pos)
+        if HAS_MASK:
+            mask_values = tl.load(
+                attention_mask
+                + batch_idx * mask_stride_b
+                + mask_head_idx * mask_stride_h
+                + query_idx * mask_stride_q
+                + offs_n * mask_stride_k,
+                mask=kv_mask,
+                other=0,
+            )
+            valid = valid & mask_values
+
+        k_block = tl.load(
+            k + kv_offset + offs_n[:, None] * head_dim + offs_d[None, :],
+            mask=kv_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        v_block = tl.load(
+            v + kv_offset + offs_n[:, None] * head_dim + offs_d[None, :],
+            mask=kv_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        qk = tl.sum(k_block * q_vec[None, :], axis=1) * qk_scale
+        p = tl.exp2(tl.where(valid, qk - m_i, -float("inf")))
+        dp = tl.sum(v_block * do_vec[None, :], axis=1)
+        ds = p * (dp - d_i) * sm_scale
+        dq_vec += tl.sum(ds[:, None] * k_block, axis=0)
+
+    tl.store(dq + q_offset + offs_d, dq_vec)
+
+
+@triton.jit
+def _attention_bwd_dkdv_kernel(
+    q,
+    k,
+    v,
+    attention_mask,
+    do,
+    logsumexp,
+    delta,
+    dk,
+    dv,
+    sm_scale,
+    q_len: tl.constexpr,
+    kv_len: tl.constexpr,
+    head_dim: tl.constexpr,
+    n_heads: tl.constexpr,
+    mask_heads: tl.constexpr,
+    mask_stride_b: tl.constexpr,
+    mask_stride_h: tl.constexpr,
+    mask_stride_q: tl.constexpr,
+    mask_stride_k: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    key_idx = row_idx % kv_len
+    head_batch_idx = row_idx // kv_len
+    batch_idx = head_batch_idx // n_heads
+    head_idx = head_batch_idx - batch_idx * n_heads
+    mask_head_idx = tl.minimum(head_idx, mask_heads - 1)
+
+    offs_d = tl.arange(0, head_dim)
+    offs_m_base = tl.arange(0, BLOCK_M)
+    q_offset = head_batch_idx * q_len * head_dim
+    kv_offset = head_batch_idx * kv_len * head_dim + key_idx * head_dim
+    k_vec = tl.load(k + kv_offset + offs_d).to(tl.float32)
+    v_vec = tl.load(v + kv_offset + offs_d).to(tl.float32)
+
+    dk_vec = tl.zeros((head_dim,), dtype=tl.float32)
+    dv_vec = tl.zeros((head_dim,), dtype=tl.float32)
+    qk_scale = sm_scale * 1.4426950408889634
+    for start_m in range(0, q_len, BLOCK_M):
+        offs_m = start_m + offs_m_base
+        q_mask = offs_m < q_len
+        q_abs_pos = kv_len - q_len + offs_m
+        valid = q_mask & (key_idx <= q_abs_pos)
+        if HAS_MASK:
+            mask_values = tl.load(
+                attention_mask
+                + batch_idx * mask_stride_b
+                + mask_head_idx * mask_stride_h
+                + offs_m * mask_stride_q
+                + key_idx * mask_stride_k,
+                mask=q_mask,
+                other=0,
+            )
+            valid = valid & mask_values
+
+        q_block = tl.load(
+            q + q_offset + offs_m[:, None] * head_dim + offs_d[None, :],
+            mask=q_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        do_block = tl.load(
+            do + q_offset + offs_m[:, None] * head_dim + offs_d[None, :],
+            mask=q_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        m_i = tl.load(logsumexp + head_batch_idx * q_len + offs_m, mask=q_mask, other=-float("inf"))
+        d_i = tl.load(delta + head_batch_idx * q_len + offs_m, mask=q_mask, other=0.0)
+
+        qk = tl.sum(q_block * k_vec[None, :], axis=1) * qk_scale
+        p = tl.exp2(tl.where(valid, qk - m_i, -float("inf")))
+        dp = tl.sum(do_block * v_vec[None, :], axis=1)
+        ds = p * (dp - d_i) * sm_scale
+        dk_vec += tl.sum(ds[:, None] * q_block, axis=0)
+        dv_vec += tl.sum(p[:, None] * do_block, axis=0)
+
+    tl.store(dk + kv_offset + offs_d, dk_vec)
+    tl.store(dv + kv_offset + offs_d, dv_vec)
+
+
+def _causal_attention_forward(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attention_mask: torch.Tensor,
     scaling: float,
-) -> torch.Tensor:
+    attention_mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
     batch, heads, q_len, head_dim = query.shape
     kv_len = key.shape[2]
     mask = _normalize_attention_mask(attention_mask, batch, heads, q_len, kv_len)
     if mask is None:
-        raise RuntimeError("masked prefill attention requires a non-empty mask")
-    query = query.contiguous()
-    key = key.contiguous()
-    value = value.contiguous()
+        mask_arg = query
+        mask_heads = 1
+        mask_stride_b = mask_stride_h = mask_stride_q = mask_stride_k = 0
+    else:
+        mask_arg = mask
+        mask_heads = mask.shape[1]
+        mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k = mask.stride()
     output = torch.empty_like(query)
-    mask_heads = mask.shape[1]
-    mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k = mask.stride()
+    logsumexp = torch.empty((batch, heads, q_len), dtype=torch.float32, device=query.device)
     grid = (triton.cdiv(q_len, 16), batch * heads)
-    _masked_prefill_attention_kernel[grid](
+    _causal_attention_fwd_kernel[grid](
         query,
         key,
         value,
-        mask,
+        mask_arg,
         output,
+        logsumexp,
         float(scaling),
         q_len,
         kv_len,
@@ -247,12 +434,154 @@ def _masked_prefill_attention(
         mask_stride_h,
         mask_stride_q,
         mask_stride_k,
+        mask is not None,
         BLOCK_M=16,
         BLOCK_N=16,
         num_warps=4,
         num_stages=1,
     )
-    return output
+    return output, logsumexp, mask
+
+
+class _CausalAttention(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        scaling: float,
+    ) -> torch.Tensor:
+        output, logsumexp, mask = _causal_attention_forward(query, key, value, scaling, attention_mask)
+        if mask is None:
+            ctx.save_for_backward(query, key, value, output, logsumexp)
+        else:
+            ctx.save_for_backward(query, key, value, output, logsumexp, mask)
+        ctx.has_mask = mask is not None
+        ctx.scaling = float(scaling)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        saved = ctx.saved_tensors
+        if ctx.has_mask:
+            query, key, value, output, logsumexp, mask = saved
+        else:
+            query, key, value, output, logsumexp = saved
+            mask = None
+
+        grad_output = grad_output.contiguous()
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+        output = output.contiguous()
+        batch, heads, q_len, head_dim = query.shape
+        kv_len = key.shape[2]
+
+        if mask is None:
+            mask_arg = query
+            mask_heads = 1
+            mask_stride_b = mask_stride_h = mask_stride_q = mask_stride_k = 0
+        else:
+            mask = mask.contiguous()
+            mask_arg = mask
+            mask_heads = mask.shape[1]
+            mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k = mask.stride()
+
+        grad_query = torch.empty_like(query)
+        grad_key = torch.empty_like(key)
+        grad_value = torch.empty_like(value)
+        delta = torch.empty((batch, heads, q_len), dtype=torch.float32, device=query.device)
+        total_q = batch * heads * q_len
+        _attention_bwd_delta_kernel[(total_q,)](
+            output,
+            grad_output,
+            delta,
+            total_q,
+            head_dim,
+            num_warps=4,
+        )
+        _attention_bwd_dq_kernel[(total_q,)](
+            query,
+            key,
+            value,
+            mask_arg,
+            grad_output,
+            logsumexp,
+            delta,
+            grad_query,
+            ctx.scaling,
+            q_len,
+            kv_len,
+            head_dim,
+            heads,
+            mask_heads,
+            mask_stride_b,
+            mask_stride_h,
+            mask_stride_q,
+            mask_stride_k,
+            mask is not None,
+            BLOCK_N=8,
+            num_warps=4,
+            num_stages=1,
+        )
+        _attention_bwd_dkdv_kernel[(batch * heads * kv_len,)](
+            query,
+            key,
+            value,
+            mask_arg,
+            grad_output,
+            logsumexp,
+            delta,
+            grad_key,
+            grad_value,
+            ctx.scaling,
+            q_len,
+            kv_len,
+            head_dim,
+            heads,
+            mask_heads,
+            mask_stride_b,
+            mask_stride_h,
+            mask_stride_q,
+            mask_stride_k,
+            mask is not None,
+            BLOCK_M=8,
+            num_warps=4,
+            num_stages=1,
+        )
+        return grad_query, grad_key, grad_value, None, None
+
+
+def _causal_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scaling: float,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if key.shape[2] != value.shape[2]:
+        raise RuntimeError(f"causal attention requires k/v to share sequence length, got {key.shape[2]}/{value.shape[2]}")
+    if query.shape[2] > key.shape[2]:
+        raise RuntimeError(f"causal attention got q_len > kv_len: {query.shape[2]}>{key.shape[2]}")
+    return _CausalAttention.apply(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        attention_mask,
+        float(scaling),
+    )
+
+
+def _masked_prefill_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor,
+    scaling: float,
+) -> torch.Tensor:
+    return _causal_attention(query, key, value, scaling, attention_mask)
 
 
 def _decode_attention(
@@ -262,6 +591,8 @@ def _decode_attention(
     scaling: float,
     attention_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad):
+        return _causal_attention(query, key, value, scaling, attention_mask)
     query = query.contiguous()
     key = key.contiguous()
     value = value.contiguous()
@@ -331,6 +662,7 @@ def register_triton_sm75_hd256_padded_backend() -> dict[str, int]:
         kv_len = key.shape[2]
         if n_ctx > kv_len:
             raise RuntimeError(f"local Triton backend got q_len > kv_len: {n_ctx}>{kv_len}")
+        needs_grad = torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad)
         if n_ctx < kv_len:
             calls["decode"] += 1
             out = _decode_attention(
@@ -350,6 +682,9 @@ def register_triton_sm75_hd256_padded_backend() -> dict[str, int]:
                 attention_mask,
                 float(scaling if scaling is not None else module.scaling),
             )
+            return out.transpose(1, 2).contiguous(), None
+        if needs_grad:
+            out = _causal_attention(query, key, value, float(scaling if scaling is not None else module.scaling))
             return out.transpose(1, 2).contiguous(), None
 
         pad = (-n_ctx) % 16

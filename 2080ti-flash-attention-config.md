@@ -99,7 +99,7 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=1 python /home/z/文档/triton/test_flas
   - `max_abs_dk=0.004150`
   - `max_abs_dv=0.003906`
 
-## Qwen3.5-9B / `HEAD_DIM=256` 前向和 KV cache 验证
+## Qwen3.5-9B / `HEAD_DIM=256` 前向、反向和 KV cache 验证
 
 更新时间：2026-05-09
 
@@ -118,14 +118,16 @@ Required: 98304, Hardware limit: 65536
 - `BLOCK_M=16, BLOCK_N=32`：数值错误。
 - `BLOCK_N<16`：Triton `tl.dot` 编译失败，K 维低于最小要求。
 
-推荐的推理路径是：
+推荐的推理 / 训练路径是：
 
-1. full-attention prefill 使用 `BLOCK_M=16, BLOCK_N=16, num_stages=1, num_warps=4`。
-2. 在 Python backend wrapper 中把 prefill `N_CTX` pad 到 16 的倍数。
-3. 调用 Triton attention 后 slice 回原始 `N_CTX`。
-4. cached decode 使用本地 `_decode_attention_kernel`，`BLOCK_N=16`，支持
-   `q_len < kv_len` 和 `HEAD_DIM=256`。
-5. decode 的 causal 位置按 suffix 语义计算：
+1. 无梯度 full-attention prefill 使用 `BLOCK_M=16, BLOCK_N=16,
+   num_stages=1, num_warps=4`，并在 Python backend wrapper 中把 `N_CTX`
+   pad 到 16 的倍数后 slice 回原始长度。
+2. 需要反向时，unmasked prefill 也走本地 `_CausalAttention` autograd，
+   避开教程 backward 在 `HEAD_DIM=256` 上的 shared-memory 超限。
+3. masked prefill / cached decode 统一使用本地 causal attention kernels，
+   支持 `q_len <= kv_len` 和 `HEAD_DIM=256`。
+4. decode 的 causal 位置按 suffix 语义计算：
    `query_abs_pos = kv_len - q_len + query_idx`。
 
 随机张量验证已覆盖：
@@ -179,22 +181,38 @@ mask 支持说明：
 
 - 自定义 attention backend 已注册 Transformers 的 `sdpa_mask` mask interface。
 - 无 padding 的标准 causal mask 会跳过显式 mask，继续走本地 Triton padded
-  prefill / decode kernel。
-- masked prefill 收到 4D bool mask 时由 `_masked_prefill_attention_kernel`
+  prefill / decode kernel；需要梯度时改走 `_CausalAttention`。
+- masked prefill 收到 4D bool mask 时由 `_causal_attention_fwd_kernel`
   直接执行 block-wise online softmax 和 value 聚合。
-- cached decode 收到 4D bool mask 时由 `_decode_attention_kernel` 直接应用。
+- cached decode 收到 4D bool mask 时由 `_decode_attention_kernel` 或
+  autograd 路径中的 `_causal_attention_fwd_kernel` 直接应用。
 - `full_attention_calls['masked']` 计数的是 fused Triton masked prefill。
+
+反向支持说明：
+
+- `_CausalAttention` 保存 forward 输出和 logsumexp，backward 由 Triton kernel
+  重新计算 softmax 概率。
+- 反向 kernel：
+  - `_attention_bwd_delta_kernel`：计算 `delta = sum(out * d_out)`。
+  - `_attention_bwd_dq_kernel`：按 query row 计算 `dQ`。
+  - `_attention_bwd_dkdv_kernel`：按 key/value row 计算 `dK/dV`。
+- 已验证随机张量 case：
+  `q_len/kv_len in {(1,1), (4,4), (17,17), (5,5 masked),
+  (1,9), (3,11), (4,13 masked)}`，`HEAD_DIM=256`。
+- 对齐 PyTorch reference：forward 最大误差 `<= 4.88e-4`，
+  `dQ/dK` 最大误差 `<= 3.1e-5`，`dV` 最大误差 `<= 4.88e-4`。
+- backend wrapper 训练态 unmasked prefill `N_CTX=5, HEAD_DIM=256` 已通过，
+  不再触发教程 backward 的 shared-memory 超限。
 
 当前限制：
 
-- 当前验证范围是 Qwen3.5-9B text full-attention inference：
+- 当前验证范围是 Qwen3.5-9B text full-attention：
   `causal=True`、`dtype=torch.float16`、`HEAD_DIM=256`。
 - `q_len > kv_len` 被视为非法 cache 状态。
-- masked prefill kernel 当前是 forward-only inference 路径，没有实现反向。
 - head-dim 分块不能简单切 `HEAD_DIM` 后分别 softmax；正确实现需要两阶段算法：
   先跨 head-dim 分块累计完整 `QK^T` 的 softmax 统计量，再按 value/output
   分块写回。这是更大的 kernel 重写；当前更小 tile + padding + decode kernel
-  已解决 `HEAD_DIM=256` 的 Qwen3.5-9B 4bit 推理路径。
+  已解决 `HEAD_DIM=256` 的 Qwen3.5-9B 4bit 前向、反向和 KV cache 路径。
 
 ## 如何复现
 
@@ -227,9 +245,10 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=1 python /home/z/文档/triton/test_flas
   - `dtype=torch.float16`
   - `HEAD_DIM in {64, 128}`
   - `N_CTX in {128, 1024}`
-- Qwen3.5-9B text full-attention 的 `HEAD_DIM=256` 推理路径已单独验证：
+- Qwen3.5-9B text full-attention 的 `HEAD_DIM=256` 路径已单独验证：
   - prefill：`BLOCK_M=16, BLOCK_N=16` + padding wrapper
   - cached decode：本地 `_decode_attention_kernel`
+  - 反向：本地 `_CausalAttention` autograd + Triton backward kernels
   - linear-attention：FLA `chunk` / `recurrent`
 - 还没有验证：
   - `non-causal`
