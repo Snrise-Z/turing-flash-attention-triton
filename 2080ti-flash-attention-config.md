@@ -99,6 +99,64 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=1 python /home/z/文档/triton/test_flas
   - `max_abs_dk=0.004150`
   - `max_abs_dv=0.003906`
 
+## Qwen3.5-9B / `HEAD_DIM=256` 前向验证
+
+更新时间：2026-05-09
+
+Qwen3.5-9B 的 full-attention 层使用 `HEAD_DIM=256`。2080 Ti 上原 `sm75`
+配置 `BLOCK_M=64, BLOCK_N=32` 会触发 shared memory 超限：
+
+```text
+Required: 98304, Hardware limit: 65536
+```
+
+实测更小 tile 的结果：
+
+- `BLOCK_M=32, BLOCK_N=32`：`128x256` 通过。
+- `BLOCK_M=32, BLOCK_N=16`：`128x256`、`1024x256` 通过；`N_CTX<32` 不适合直接跑。
+- `BLOCK_M=16, BLOCK_N=16`：`16x256`、`128x256`、`1024x256` 通过。
+- `BLOCK_M=16, BLOCK_N=32`：数值错误。
+- `BLOCK_N<16`：Triton `tl.dot` 编译失败，K 维低于最小要求。
+
+推荐的推理前向路径是：
+
+1. full-attention 使用 `BLOCK_M=16, BLOCK_N=16, num_stages=1, num_warps=4`。
+2. 在 Python backend wrapper 中把 `N_CTX` pad 到 16 的倍数。
+3. 调用 Triton attention 后 slice 回原始 `N_CTX`。
+
+随机张量验证已覆盖：
+
+```text
+N_CTX in {1, 4, 5, 8, 15, 16, 20, 31, 32, 128}, HEAD_DIM=256
+```
+
+均与 PyTorch causal attention 在 `atol=1e-2, rtol=0` 下对齐。
+
+Qwen3.5-9B 4bit 单卡 GPU3 验证命令：
+
+```bash
+PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=3 HF_HUB_OFFLINE=1 \
+  python test_qwen35_9b_triton_sm75.py --generate
+```
+
+实测结果：
+
+- 4bit 加载成功，峰值显存约 `7.454 GiB`。
+- full-attention 调用本地 padded Triton backend。
+- linear-attention 调用 FLA `chunk_gated_delta_rule`。
+- `generate(..., max_new_tokens=1, use_cache=False)` 成功。
+
+当前限制：
+
+- 本地 Triton full-attention backend 只覆盖 prefill / `use_cache=False`，要求
+  `q/k/v` 序列长度相同。
+- cached decode 的 full-attention 层会出现 `q_len != kv_len`，还需要单独实现
+  decode kernel 或在该路径 fallback。
+- head-dim 分块不能简单切 `HEAD_DIM` 后分别 softmax；正确实现需要两阶段算法：
+  先跨 head-dim 分块累计完整 `QK^T` 的 softmax 统计量，再按 value/output
+  分块写回。这是更大的 kernel 重写；当前更小 tile + padding 已解决
+  `HEAD_DIM=256` prefill 前向。
+
 ## 如何复现
 
 ### 1. 测官方默认配置

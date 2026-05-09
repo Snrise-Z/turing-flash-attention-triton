@@ -13,6 +13,62 @@ import torch
 ROOT = Path(__file__).resolve().parent
 TUTORIAL_PATH = ROOT / "06-fused-attention.py"
 
+PROFILE_CONFIGS = {
+    "sm75": {
+        "fwd": {"BLOCK_M": 64, "BLOCK_N": 32, "num_stages": 1, "num_warps": 4},
+        "bwd": "BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 32, 32, 32",
+        "description": (
+            "profile=sm75 fwd(BLOCK_M=64,BLOCK_N=32,num_stages=1,num_warps=4) "
+            "bwd(BLOCK_M1=32,BLOCK_N1=32,BLOCK_M2=32,BLOCK_N2=32,num_stages=1,num_warps=4)"
+        ),
+    },
+    "sm75-hd256-32x32": {
+        "fwd": {"BLOCK_M": 32, "BLOCK_N": 32, "num_stages": 1, "num_warps": 4},
+        "bwd": "BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 32, 32, 32",
+        "description": "profile=sm75-hd256-32x32 fwd(BLOCK_M=32,BLOCK_N=32,num_stages=1,num_warps=4)",
+    },
+    "sm75-hd256-32x16": {
+        "fwd": {"BLOCK_M": 32, "BLOCK_N": 16, "num_stages": 1, "num_warps": 4},
+        "bwd": "BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 32, 32, 32",
+        "description": "profile=sm75-hd256-32x16 fwd(BLOCK_M=32,BLOCK_N=16,num_stages=1,num_warps=4)",
+    },
+    "sm75-hd256-16x32": {
+        "fwd": {"BLOCK_M": 16, "BLOCK_N": 32, "num_stages": 1, "num_warps": 4},
+        "bwd": "BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 32, 32, 32",
+        "description": "profile=sm75-hd256-16x32 fwd(BLOCK_M=16,BLOCK_N=32,num_stages=1,num_warps=4)",
+    },
+    "sm75-hd256-16x16": {
+        "fwd": {"BLOCK_M": 16, "BLOCK_N": 16, "num_stages": 1, "num_warps": 4},
+        "bwd": "BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 32, 32, 32",
+        "description": "profile=sm75-hd256-16x16 fwd(BLOCK_M=16,BLOCK_N=16,num_stages=1,num_warps=4)",
+    },
+    "sm75-hd256-8x16": {
+        "fwd": {"BLOCK_M": 8, "BLOCK_N": 16, "num_stages": 1, "num_warps": 4},
+        "bwd": "BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 32, 32, 32",
+        "description": "profile=sm75-hd256-8x16 fwd(BLOCK_M=8,BLOCK_N=16,num_stages=1,num_warps=4)",
+    },
+    "sm75-hd256-4x16": {
+        "fwd": {"BLOCK_M": 4, "BLOCK_N": 16, "num_stages": 1, "num_warps": 4},
+        "bwd": "BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 32, 32, 32",
+        "description": "profile=sm75-hd256-4x16 fwd(BLOCK_M=4,BLOCK_N=16,num_stages=1,num_warps=4)",
+    },
+    "sm75-hd256-8x8": {
+        "fwd": {"BLOCK_M": 8, "BLOCK_N": 8, "num_stages": 1, "num_warps": 4},
+        "bwd": "BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 32, 32, 32",
+        "description": "profile=sm75-hd256-8x8 fwd(BLOCK_M=8,BLOCK_N=8,num_stages=1,num_warps=4)",
+    },
+    "sm75-hd256-4x4": {
+        "fwd": {"BLOCK_M": 4, "BLOCK_N": 4, "num_stages": 1, "num_warps": 4},
+        "bwd": "BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 32, 32, 32",
+        "description": "profile=sm75-hd256-4x4 fwd(BLOCK_M=4,BLOCK_N=4,num_stages=1,num_warps=4)",
+    },
+    "sm75-hd256-1x1": {
+        "fwd": {"BLOCK_M": 1, "BLOCK_N": 1, "num_stages": 1, "num_warps": 4},
+        "bwd": "BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 32, 32, 32",
+        "description": "profile=sm75-hd256-1x1 fwd(BLOCK_M=1,BLOCK_N=1,num_stages=1,num_warps=4)",
+    },
+}
+
 
 class _FakeMark:
     def parametrize(self, *args, **kwargs):
@@ -32,13 +88,16 @@ def _load_tutorial_module(use_single_config, profile):
     )
     sys.modules.setdefault("pytest", fake_pytest)
     module_path = TUTORIAL_PATH
-    if profile == "sm75":
+    if profile in PROFILE_CONFIGS:
+        profile_config = PROFILE_CONFIGS[profile]
+        fwd = profile_config["fwd"]
         text = TUTORIAL_PATH.read_text()
         prefix, rest = text.split("configs = [", 1)
         _, suffix = rest.split("def keep", 1)
         custom_configs = (
             "configs = [\n"
-            "    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=1, num_warps=4, "
+            f"    triton.Config({{'BLOCK_M': {fwd['BLOCK_M']}, 'BLOCK_N': {fwd['BLOCK_N']}}}, "
+            f"num_stages={fwd['num_stages']}, num_warps={fwd['num_warps']}, "
             "pre_hook=_host_descriptor_pre_hook),\n"
             "]\n\n\n"
             "def keep"
@@ -47,9 +106,9 @@ def _load_tutorial_module(use_single_config, profile):
         text = text.replace("NUM_WARPS, NUM_STAGES = 4, 5", "NUM_WARPS, NUM_STAGES = 4, 1")
         text = text.replace(
             "BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32",
-            "BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 32, 32, 32",
+            profile_config["bwd"],
         )
-        module_path = ROOT / "06-fused-attention-sm75.py"
+        module_path = ROOT / ("06-fused-attention-sm75.py" if profile == "sm75" else f"06-fused-attention-{profile}.py")
         module_path.write_text(text)
     spec = importlib.util.spec_from_file_location("triton_flash_tutorial", module_path)
     module = importlib.util.module_from_spec(spec)
@@ -129,7 +188,7 @@ def main():
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--heads", type=int, default=2)
     parser.add_argument("--mode", choices=["fwd", "both"], default="both")
-    parser.add_argument("--profile", choices=["official", "sm75"], default="official")
+    parser.add_argument("--profile", choices=["official", *PROFILE_CONFIGS], default="official")
     parser.add_argument(
         "--full-autotune",
         action="store_true",
@@ -156,12 +215,8 @@ def main():
     except Exception as exc:
         print(f"triton import failed: {exc}", flush=True)
 
-    if args.profile == "sm75":
-        print(
-            "profile=sm75 fwd(BLOCK_M=64,BLOCK_N=32,num_stages=1,num_warps=4) "
-            "bwd(BLOCK_M1=32,BLOCK_N1=32,BLOCK_M2=32,BLOCK_N2=32,num_stages=1,num_warps=4)",
-            flush=True,
-        )
+    if args.profile in PROFILE_CONFIGS:
+        print(PROFILE_CONFIGS[args.profile]["description"], flush=True)
     module = _load_tutorial_module(use_single_config=not args.full_autotune, profile=args.profile)
     dtype = torch.float16
 
