@@ -216,6 +216,66 @@ mask 支持说明：
 
 ## 如何复现
 
+### 本地推理服务
+
+服务脚本：[serve_qwen35_9b.py](/home/z/文档/triton-flash-attention/serve_qwen35_9b.py)
+
+默认配置：
+
+- 模型：本地 `Qwen3.5-9B` snapshot
+- 量化：bitsandbytes 4bit NF4
+- GPU：通过 `CUDA_VISIBLE_DEVICES` 指定，推荐 `CUDA_VISIBLE_DEVICES=3`
+- full-attention：`xformers_memory_efficient_aligned`
+- linear-attention：模型内 FLA
+- 端口：`127.0.0.1:8000`
+
+启动：
+
+```bash
+CUDA_VISIBLE_DEVICES=3 HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1 \
+  python -m uvicorn serve_qwen35_9b:app --host 127.0.0.1 --port 8000
+```
+
+后台启动示例：
+
+```bash
+setsid env CUDA_VISIBLE_DEVICES=3 HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1 \
+  python -m uvicorn serve_qwen35_9b:app --host 127.0.0.1 --port 8000 \
+  > qwen35_server.log 2>&1 < /dev/null &
+echo $! > qwen35_server.pid
+```
+
+健康检查：
+
+```bash
+curl -fsS http://127.0.0.1:8000/health
+```
+
+文本生成：
+
+```bash
+curl -fsS http://127.0.0.1:8000/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"VLN是什么？","max_new_tokens":64,"temperature":0}'
+```
+
+OpenAI 风格接口：
+
+```bash
+curl -fsS http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"用一句话解释VLN。"}],"max_tokens":64,"temperature":0}'
+```
+
+当前实测：
+
+- `/health` 正常，加载耗时约 `10.5s`，常驻显存约 `7.35 GiB`。
+- `/generate` 正常，`max_new_tokens=6` 时峰值显存约 `7.479 GiB`。
+- 每次请求返回 `full_attention_calls` 和 `fla_calls`，可确认 full-attention
+  走 xFormers，linear-attention 走 FLA。
+- 服务每次请求前会重置 Qwen3.5 的 `rope_deltas`，避免 generation 状态污染
+  后续请求。
+
 ### xFormers memory-efficient attention + FLA
 
 新增脚本 [test_qwen35_9b_xformers_fla.py](/home/z/文档/triton-flash-attention/test_qwen35_9b_xformers_fla.py)
@@ -309,3 +369,4 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=1 python /home/z/文档/triton/test_flas
 - `sm75` 测试副本：[06-fused-attention-sm75.py](/home/z/文档/triton/06-fused-attention-sm75.py)
 - 测试脚本：[test_flash_attention_2080ti.py](/home/z/文档/triton/test_flash_attention_2080ti.py)
 - xFormers + FLA 测试脚本：[test_qwen35_9b_xformers_fla.py](/home/z/文档/triton-flash-attention/test_qwen35_9b_xformers_fla.py)
+- 推理服务脚本：[serve_qwen35_9b.py](/home/z/文档/triton-flash-attention/serve_qwen35_9b.py)
