@@ -216,6 +216,53 @@ mask 支持说明：
 
 ## 如何复现
 
+### xFormers memory-efficient attention + FLA
+
+新增脚本 [test_qwen35_9b_xformers_fla.py](/home/z/文档/triton-flash-attention/test_qwen35_9b_xformers_fla.py)
+用于验证 full-attention 走 xFormers、linear-attention 继续走 FLA。
+
+关键点：
+
+- full-attention 调用 `xformers.ops.memory_efficient_attention`。
+- 无 mask prefill 使用 `LowerTriangularMask`。
+- 无 mask cached decode 使用 `LowerTriangularFromBottomRightMask`。
+- padding / Tensor mask 使用 aligned additive bias：
+  底层分配 `[B, H, Q, ceil(K/8)*8]`，再切片成真实 `[B, H, Q, K]`，
+  保证 `attn_bias.stride(-2) % 8 == 0`。
+- 对 fully-masked query row 做显式 zero-out，避免 xFormers cutlass kernel
+  对全 masked 行返回非零值。
+
+随机张量验证覆盖：
+
+```text
+(q_len, kv_len) in {(1,1), (5,5), (5,7), (3,11), (17,17)}, HEAD_DIM=256
+```
+
+其中包含非 8 倍数 `kv_len` 和 all-masked query row。对齐 PyTorch reference
+的最大误差 `<= 4.88e-4`，且输出全 finite。
+
+整模型验证命令：
+
+```bash
+PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=3 HF_HUB_OFFLINE=1 \
+  python test_qwen35_9b_xformers_fla.py --max-new-tokens 3
+```
+
+实测结果：
+
+- `xformers=0.0.31.post1`
+- 单样本生成通过：
+  - `single_fla_calls={'chunk': 48, 'recurrent': 48}`
+  - `single_full_attention_calls={'n': 32, 'prefill': 16, 'decode': 16, 'masked': 0, 'aligned_bias': 0}`
+  - 峰值显存约 `7.479 GiB`
+- batch padding + KV cache 通过：
+  - `padded_fla_calls={'chunk': 72, 'recurrent': 72}`
+  - `padded_full_attention_calls={'n': 48, 'prefill': 24, 'decode': 24, 'masked': 16, 'aligned_bias': 16}`
+  - 峰值显存约 `7.506 GiB`
+
+注意：脚本在单样本 `generate()` 后会重置模型里的 `rope_deltas`，避免 Qwen3.5
+多模态 generation 状态污染后续手动 padded-cache smoke test。
+
 ### 1. 测官方默认配置
 
 前向：
@@ -261,3 +308,4 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=1 python /home/z/文档/triton/test_flas
 - 官方教程实现：[06-fused-attention.py](/home/z/文档/triton/06-fused-attention.py)
 - `sm75` 测试副本：[06-fused-attention-sm75.py](/home/z/文档/triton/06-fused-attention-sm75.py)
 - 测试脚本：[test_flash_attention_2080ti.py](/home/z/文档/triton/test_flash_attention_2080ti.py)
+- xFormers + FLA 测试脚本：[test_qwen35_9b_xformers_fla.py](/home/z/文档/triton-flash-attention/test_qwen35_9b_xformers_fla.py)
