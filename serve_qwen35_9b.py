@@ -7,7 +7,7 @@ from typing import Any
 import torch
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from transformers import AutoModelForImageTextToText, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
 
 from test_qwen35_9b_xformers_fla import count_fla_calls, register_xformers_memory_efficient_backend
 
@@ -19,9 +19,13 @@ DEFAULT_MODEL_PATH = (
 MODEL_PATH = os.environ.get("QWEN35_MODEL_PATH", DEFAULT_MODEL_PATH)
 ATTN_IMPLEMENTATION = "xformers_memory_efficient_aligned"
 MAX_CONTEXT_TOKENS = int(os.environ.get("QWEN35_MAX_CONTEXT_TOKENS", "80000"))
+IMAGE_MIN_PIXELS = int(os.environ.get("QWEN35_IMAGE_MIN_PIXELS", "65536"))
+IMAGE_MAX_PIXELS = int(os.environ.get("QWEN35_IMAGE_MAX_PIXELS", str(1024 * 1024)))
+ENABLE_THINKING = os.environ.get("QWEN35_ENABLE_THINKING", "0").lower() not in {"0", "false", "no", "off"}
 
 state: dict[str, Any] = {
     "model": None,
+    "processor": None,
     "tokenizer": None,
     "full_attention_calls": None,
     "fla_calls": None,
@@ -32,6 +36,7 @@ generate_lock = threading.Lock()
 
 class GenerateRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
+    images: list[str] | None = None
     max_new_tokens: int = Field(default=128, ge=1, le=4096)
     temperature: float = Field(default=0.0, ge=0.0)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
@@ -41,7 +46,7 @@ class GenerateRequest(BaseModel):
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: str | list[dict[str, Any]]
 
 
 class ChatCompletionRequest(BaseModel):
@@ -85,6 +90,112 @@ def _apply_stop(text: str, stop: list[str] | None) -> str:
     return text[:cut]
 
 
+def _image_source_to_block(source: str) -> dict[str, str]:
+    source = source.strip()
+    if not source:
+        raise HTTPException(status_code=400, detail="image source cannot be empty")
+    if source.startswith("file://"):
+        source = source[len("file://") :]
+    if source.startswith(("http://", "https://", "data:image/")):
+        return {"type": "image", "url": source}
+    path = os.path.expanduser(source)
+    if os.path.isfile(path):
+        return {"type": "image", "path": path}
+    return {"type": "image", "base64": source}
+
+
+def _normalize_content(content: str | list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    if not isinstance(content, list):
+        raise HTTPException(status_code=400, detail="message content must be a string or a list")
+
+    normalized: list[dict[str, Any]] = []
+    for item in content:
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail="content blocks must be JSON objects")
+        item_type = item.get("type")
+        if item_type == "text" or ("text" in item and item_type is None):
+            text = item.get("text")
+            if not isinstance(text, str):
+                raise HTTPException(status_code=400, detail="text content block requires a string text field")
+            normalized.append({"type": "text", "text": text})
+        elif item_type == "image_url" or "image_url" in item:
+            image_url = item.get("image_url")
+            source = image_url.get("url") if isinstance(image_url, dict) else image_url
+            if not isinstance(source, str):
+                raise HTTPException(status_code=400, detail="image_url content block requires a url string")
+            normalized.append(_image_source_to_block(source))
+        elif item_type == "image" or any(key in item for key in ("image", "url", "path", "base64")):
+            source = next((item[key] for key in ("image", "url", "path", "base64") if key in item), None)
+            if not isinstance(source, str):
+                raise HTTPException(status_code=400, detail="image content block requires a string source")
+            normalized.append(_image_source_to_block(source))
+        else:
+            raise HTTPException(status_code=400, detail=f"unsupported content block type: {item_type}")
+    return normalized
+
+
+def _normalize_messages(messages: list[ChatMessage]) -> list[dict[str, Any]]:
+    normalized = []
+    for message in messages:
+        payload = message.model_dump()
+        role = payload.get("role")
+        if not isinstance(role, str) or not role:
+            raise HTTPException(status_code=400, detail="message role must be a non-empty string")
+        payload["content"] = _normalize_content(payload["content"])
+        normalized.append(payload)
+    return normalized
+
+
+def _processor_kwargs() -> dict[str, Any]:
+    return {
+        "images_kwargs": {
+            "size": {
+                "shortest_edge": IMAGE_MIN_PIXELS,
+                "longest_edge": IMAGE_MAX_PIXELS,
+            }
+        }
+    }
+
+
+def _inputs_from_messages(messages: list[dict[str, Any]]):
+    processor = state["processor"]
+    if processor is None:
+        raise HTTPException(status_code=503, detail="Processor is not loaded")
+    try:
+        return processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            add_generation_prompt=True,
+            processor_kwargs=_processor_kwargs(),
+            enable_thinking=ENABLE_THINKING,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to preprocess multimodal input: {exc}") from exc
+
+
+def _inputs_from_request(request: GenerateRequest):
+    tokenizer = state["tokenizer"]
+    if tokenizer is None:
+        raise HTTPException(status_code=503, detail="Tokenizer is not loaded")
+    if not request.images:
+        return tokenizer(request.prompt, return_tensors="pt")
+
+    messages = [
+        {
+            "role": "user",
+            "content": [_image_source_to_block(source) for source in request.images]
+            + [{"type": "text", "text": request.prompt}],
+        }
+    ]
+    return _inputs_from_messages(messages)
+
+
 def _load_model() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available")
@@ -96,7 +207,8 @@ def _load_model() -> None:
         bnb_4bit_use_double_quant=True,
         bnb_4bit_compute_dtype=torch.float16,
     )
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(MODEL_PATH, local_files_only=True, trust_remote_code=True)
+    tokenizer = processor.tokenizer
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -111,6 +223,7 @@ def _load_model() -> None:
         attn_implementation=ATTN_IMPLEMENTATION,
     ).eval()
     state["loaded_s"] = time.perf_counter() - start
+    state["processor"] = processor
     state["tokenizer"] = tokenizer
     state["model"] = model
     state["fla_calls"] = count_fla_calls(model)
@@ -141,12 +254,18 @@ def health() -> dict[str, Any]:
         "model_path": MODEL_PATH,
         "attn_implementation": ATTN_IMPLEMENTATION,
         "max_context_tokens": MAX_CONTEXT_TOKENS,
+        "vision": {
+            "enabled": state["processor"] is not None,
+            "image_min_pixels": IMAGE_MIN_PIXELS,
+            "image_max_pixels": IMAGE_MAX_PIXELS,
+            "enable_thinking": ENABLE_THINKING,
+        },
         "loaded_s": state["loaded_s"],
         "cuda": cuda_info,
     }
 
 
-def _generate_text(request: GenerateRequest) -> dict[str, Any]:
+def _generate_text(request: GenerateRequest, messages: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     model = state["model"]
     tokenizer = state["tokenizer"]
     if model is None or tokenizer is None:
@@ -157,7 +276,7 @@ def _generate_text(request: GenerateRequest) -> dict[str, Any]:
         full_before = dict(state["full_attention_calls"])
         fla_before = dict(state["fla_calls"])
         torch.cuda.reset_peak_memory_stats()
-        inputs = tokenizer(request.prompt, return_tensors="pt")
+        inputs = _inputs_from_messages(messages) if messages is not None else _inputs_from_request(request)
         prompt_tokens = int(inputs["input_ids"].shape[-1])
         requested_total_tokens = prompt_tokens + request.max_new_tokens
         if requested_total_tokens > MAX_CONTEXT_TOKENS:
@@ -222,17 +341,15 @@ def chat_completions(request: ChatCompletionRequest) -> dict[str, Any]:
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages cannot be empty")
 
-    tokenizer = state["tokenizer"]
-    if tokenizer is None:
-        raise HTTPException(status_code=503, detail="Model is not loaded")
-    prompt = _build_chat_prompt(tokenizer, request.messages)
+    messages = _normalize_messages(request.messages)
     result = _generate_text(
         GenerateRequest(
-            prompt=prompt,
+            prompt=" ",
             max_new_tokens=request.max_tokens,
             temperature=request.temperature,
             top_p=request.top_p,
-        )
+        ),
+        messages=messages,
     )
     created = int(time.time())
     return {

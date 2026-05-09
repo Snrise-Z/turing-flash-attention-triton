@@ -227,8 +227,12 @@ mask 支持说明：
 - GPU：通过 `CUDA_VISIBLE_DEVICES` 指定，推荐 `CUDA_VISIBLE_DEVICES=3`
 - full-attention：`xformers_memory_efficient_aligned`
 - linear-attention：模型内 FLA
+- 视觉：启用，支持图片 URL、`data:image/...;base64,...`、本地路径或原始 base64
 - 可用上下文：默认 `prompt_tokens + max_new_tokens <= 80000`，
   可用 `QWEN35_MAX_CONTEXT_TOKENS` 覆盖
+- 图片预处理：默认 `QWEN35_IMAGE_MIN_PIXELS=65536`、
+  `QWEN35_IMAGE_MAX_PIXELS=1048576`
+- 多模态 chat template：默认 `QWEN35_ENABLE_THINKING=0`，直接返回答案
 - 端口：`127.0.0.1:8000`
 
 启动：
@@ -263,6 +267,14 @@ curl -fsS http://127.0.0.1:8000/generate \
   -d '{"prompt":"VLN是什么？","max_new_tokens":64,"temperature":0}'
 ```
 
+图片生成：
+
+```bash
+curl -fsS http://127.0.0.1:8000/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"描述这张图。","images":["/path/to/image.png"],"max_new_tokens":64,"temperature":0}'
+```
+
 OpenAI 风格接口：
 
 ```bash
@@ -271,10 +283,22 @@ curl -fsS http://127.0.0.1:8000/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"用一句话解释VLN。"}],"max_tokens":64,"temperature":0}'
 ```
 
+OpenAI 风格图片输入：
+
+```bash
+curl -fsS http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"/path/to/image.png"}},{"type":"text","text":"这张图里有什么？"}]}],"max_tokens":64,"temperature":0}'
+```
+
 当前实测：
 
 - `/health` 正常，加载耗时约 `10.5s`，常驻显存约 `7.35 GiB`。
 - `/generate` 正常，`max_new_tokens=6` 时峰值显存约 `7.479 GiB`。
+- `/generate` 图片输入正常，`64x64` 红色 PNG 返回 `红色`，
+  峰值显存约 `7.481 GiB`。
+- `/v1/chat/completions` 的 OpenAI 风格 `image_url` 正常，`64x64` 绿色 PNG
+  返回 `绿色`，峰值显存约 `7.489 GiB`。
 - 每次请求返回 `full_attention_calls` 和 `fla_calls`，可确认 full-attention
   走 xFormers，linear-attention 走 FLA。
 - 服务每次请求前会重置 Qwen3.5 的 `rope_deltas`，避免 generation 状态污染
