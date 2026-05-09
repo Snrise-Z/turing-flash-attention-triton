@@ -124,22 +124,135 @@ def _normalize_attention_mask(
     return mask.contiguous()
 
 
-def _masked_attention(
+@triton.jit
+def _masked_prefill_attention_kernel(
+    q,
+    k,
+    v,
+    attention_mask,
+    out,
+    sm_scale,
+    q_len: tl.constexpr,
+    kv_len: tl.constexpr,
+    head_dim: tl.constexpr,
+    n_heads: tl.constexpr,
+    mask_heads: tl.constexpr,
+    mask_stride_b: tl.constexpr,
+    mask_stride_h: tl.constexpr,
+    mask_stride_q: tl.constexpr,
+    mask_stride_k: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    start_m = tl.program_id(0)
+    head_batch_idx = tl.program_id(1)
+    batch_idx = head_batch_idx // n_heads
+    head_idx = head_batch_idx - batch_idx * n_heads
+    mask_head_idx = tl.minimum(head_idx, mask_heads - 1)
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n_base = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, head_dim)
+    q_mask = offs_m < q_len
+
+    q_offset = head_batch_idx * q_len * head_dim
+    kv_offset = head_batch_idx * kv_len * head_dim
+    q_block = tl.load(
+        q + q_offset + offs_m[:, None] * head_dim + offs_d[None, :],
+        mask=q_mask[:, None],
+        other=0.0,
+    )
+
+    m_i = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, head_dim), dtype=tl.float32)
+
+    qk_scale = sm_scale * 1.4426950408889634
+    for start_n in range(0, kv_len, BLOCK_N):
+        offs_n = start_n + offs_n_base
+        kv_mask = offs_n < kv_len
+        k_block = tl.load(
+            k + kv_offset + offs_d[:, None] + offs_n[None, :] * head_dim,
+            mask=kv_mask[None, :],
+            other=0.0,
+        )
+        qk = tl.dot(q_block, k_block) * qk_scale
+
+        mask_values = tl.load(
+            attention_mask
+            + batch_idx * mask_stride_b
+            + mask_head_idx * mask_stride_h
+            + offs_m[:, None] * mask_stride_q
+            + offs_n[None, :] * mask_stride_k,
+            mask=q_mask[:, None] & kv_mask[None, :],
+            other=0,
+        )
+        valid = q_mask[:, None] & kv_mask[None, :] & mask_values
+        qk = tl.where(valid, qk, -3.4028234663852886e38)
+
+        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+        p = tl.where(valid, tl.exp2(qk - m_ij[:, None]), 0.0)
+        alpha = tl.exp2(m_i - m_ij)
+
+        v_block = tl.load(
+            v + kv_offset + offs_n[:, None] * head_dim + offs_d[None, :],
+            mask=kv_mask[:, None],
+            other=0.0,
+        )
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p.to(tl.float16), v_block, acc)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_ij
+
+    acc = tl.where(l_i[:, None] > 0.0, acc / l_i[:, None], 0.0)
+    tl.store(
+        out + q_offset + offs_m[:, None] * head_dim + offs_d[None, :],
+        acc,
+        mask=q_mask[:, None],
+    )
+
+
+def _masked_prefill_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     attention_mask: torch.Tensor,
     scaling: float,
 ) -> torch.Tensor:
-    mask = _normalize_attention_mask(attention_mask, query.shape[0], query.shape[1], query.shape[2], key.shape[2])
+    batch, heads, q_len, head_dim = query.shape
+    kv_len = key.shape[2]
+    mask = _normalize_attention_mask(attention_mask, batch, heads, q_len, kv_len)
     if mask is None:
-        raise RuntimeError("masked attention fallback requires a non-empty mask")
-    scores = torch.matmul(query, key.transpose(2, 3)) * scaling
-    scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
-    probs = torch.softmax(scores.float(), dim=-1).masked_fill(~mask, 0.0)
-    denom = probs.sum(dim=-1, keepdim=True)
-    probs = torch.where(denom > 0.0, probs / denom.clamp_min(torch.finfo(probs.dtype).tiny), probs)
-    return torch.matmul(probs.to(query.dtype), value)
+        raise RuntimeError("masked prefill attention requires a non-empty mask")
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
+    output = torch.empty_like(query)
+    mask_heads = mask.shape[1]
+    mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k = mask.stride()
+    grid = (triton.cdiv(q_len, 16), batch * heads)
+    _masked_prefill_attention_kernel[grid](
+        query,
+        key,
+        value,
+        mask,
+        output,
+        float(scaling),
+        q_len,
+        kv_len,
+        head_dim,
+        heads,
+        mask_heads,
+        mask_stride_b,
+        mask_stride_h,
+        mask_stride_q,
+        mask_stride_k,
+        BLOCK_M=16,
+        BLOCK_N=16,
+        num_warps=4,
+        num_stages=1,
+    )
+    return output
 
 
 def _decode_attention(
@@ -230,7 +343,7 @@ def register_triton_sm75_hd256_padded_backend() -> dict[str, int]:
             return out.transpose(1, 2).contiguous(), None
         if attention_mask is not None:
             calls["masked"] += 1
-            out = _masked_attention(
+            out = _masked_prefill_attention(
                 query,
                 key,
                 value,

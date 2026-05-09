@@ -172,23 +172,25 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=3 HF_HUB_OFFLINE=1 \
   `full_attention_calls={'n': 16, 'padded': 8, 'decode': 8, 'masked': 0}`。
 - batch padding + cache decode 通过：
   `full_attention_calls={'n': 16, 'padded': 0, 'decode': 8, 'masked': 8}`，
-  `fla_calls={'chunk': 24, 'recurrent': 24}`，峰值显存约 `7.609 GiB`。
+  `fla_calls={'chunk': 24, 'recurrent': 24}`，峰值显存约 `7.506 GiB`。
+  这里的 `masked=8` 对应 fused Triton masked prefill。
 
 mask 支持说明：
 
 - 自定义 attention backend 已注册 Transformers 的 `sdpa_mask` mask interface。
 - 无 padding 的标准 causal mask 会跳过显式 mask，继续走本地 Triton padded
   prefill / decode kernel。
+- masked prefill 收到 4D bool mask 时由 `_masked_prefill_attention_kernel`
+  直接执行 block-wise online softmax 和 value 聚合。
 - cached decode 收到 4D bool mask 时由 `_decode_attention_kernel` 直接应用。
-- masked prefill 走 PyTorch masked attention fallback，保证 batch padding 正确性；
-  该路径会计入 `full_attention_calls['masked']`。
+- `full_attention_calls['masked']` 计数的是 fused Triton masked prefill。
 
 当前限制：
 
 - 当前验证范围是 Qwen3.5-9B text full-attention inference：
   `causal=True`、`dtype=torch.float16`、`HEAD_DIM=256`。
 - `q_len > kv_len` 被视为非法 cache 状态。
-- masked prefill fallback 不是 fused Triton kernel，主要用于 batch padding 正确性。
+- masked prefill kernel 当前是 forward-only inference 路径，没有实现反向。
 - head-dim 分块不能简单切 `HEAD_DIM` 后分别 softmax；正确实现需要两阶段算法：
   先跨 head-dim 分块累计完整 `QK^T` 的 softmax 统计量，再按 value/output
   分块写回。这是更大的 kernel 重写；当前更小 tile + padding + decode kernel
