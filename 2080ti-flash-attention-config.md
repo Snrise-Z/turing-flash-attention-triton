@@ -99,7 +99,7 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=1 python /home/z/文档/triton/test_flas
   - `max_abs_dk=0.004150`
   - `max_abs_dv=0.003906`
 
-## Qwen3.5-9B / `HEAD_DIM=256` 前向验证
+## Qwen3.5-9B / `HEAD_DIM=256` 前向和 KV cache 验证
 
 更新时间：2026-05-09
 
@@ -118,11 +118,15 @@ Required: 98304, Hardware limit: 65536
 - `BLOCK_M=16, BLOCK_N=32`：数值错误。
 - `BLOCK_N<16`：Triton `tl.dot` 编译失败，K 维低于最小要求。
 
-推荐的推理前向路径是：
+推荐的推理路径是：
 
-1. full-attention 使用 `BLOCK_M=16, BLOCK_N=16, num_stages=1, num_warps=4`。
-2. 在 Python backend wrapper 中把 `N_CTX` pad 到 16 的倍数。
+1. full-attention prefill 使用 `BLOCK_M=16, BLOCK_N=16, num_stages=1, num_warps=4`。
+2. 在 Python backend wrapper 中把 prefill `N_CTX` pad 到 16 的倍数。
 3. 调用 Triton attention 后 slice 回原始 `N_CTX`。
+4. cached decode 使用本地 `_decode_attention_kernel`，`BLOCK_N=16`，支持
+   `q_len < kv_len` 和 `HEAD_DIM=256`。
+5. decode 的 causal 位置按 suffix 语义计算：
+   `query_abs_pos = kv_len - q_len + query_idx`。
 
 随机张量验证已覆盖：
 
@@ -136,26 +140,59 @@ Qwen3.5-9B 4bit 单卡 GPU3 验证命令：
 
 ```bash
 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=3 HF_HUB_OFFLINE=1 \
-  python test_qwen35_9b_triton_sm75.py --generate
+  python test_qwen35_9b_triton_sm75.py --generate --max-new-tokens 3
 ```
 
 实测结果：
 
-- 4bit 加载成功，峰值显存约 `7.454 GiB`。
-- full-attention 调用本地 padded Triton backend。
-- linear-attention 调用 FLA `chunk_gated_delta_rule`。
-- `generate(..., max_new_tokens=1, use_cache=False)` 成功。
+- 4bit 加载成功，峰值显存约 `7.479 GiB`。
+- full-attention prefill 调用本地 padded Triton backend。
+- full-attention cached decode 调用本地 decode kernel。
+- linear-attention prefill 调用 FLA `chunk_gated_delta_rule`。
+- linear-attention cached decode 调用 FLA `recurrent_gated_delta_rule`。
+- `fla_calls={'chunk': 48, 'recurrent': 48}`。
+- `full_attention_calls={'n': 32, 'padded': 16, 'decode': 16, 'masked': 0}`。
+
+`use_cache=False` 回归验证：
+
+```bash
+PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=3 HF_HUB_OFFLINE=1 \
+  python test_qwen35_9b_triton_sm75.py --generate --max-new-tokens 1 --no-cache
+```
+
+结果：
+
+- 峰值显存约 `7.454 GiB`。
+- `fla_calls={'chunk': 48, 'recurrent': 0}`。
+- `full_attention_calls={'n': 16, 'padded': 16, 'decode': 0, 'masked': 0}`。
+
+额外 KV cache 覆盖：
+
+- 手动 `past_key_values` + 一次送入 `2` 个新 token 通过：
+  `full_attention_calls={'n': 16, 'padded': 8, 'decode': 8, 'masked': 0}`。
+- batch padding + cache decode 通过：
+  `full_attention_calls={'n': 16, 'padded': 0, 'decode': 8, 'masked': 8}`，
+  `fla_calls={'chunk': 24, 'recurrent': 24}`，峰值显存约 `7.609 GiB`。
+
+mask 支持说明：
+
+- 自定义 attention backend 已注册 Transformers 的 `sdpa_mask` mask interface。
+- 无 padding 的标准 causal mask 会跳过显式 mask，继续走本地 Triton padded
+  prefill / decode kernel。
+- cached decode 收到 4D bool mask 时由 `_decode_attention_kernel` 直接应用。
+- masked prefill 走 PyTorch masked attention fallback，保证 batch padding 正确性；
+  该路径会计入 `full_attention_calls['masked']`。
 
 当前限制：
 
-- 本地 Triton full-attention backend 只覆盖 prefill / `use_cache=False`，要求
-  `q/k/v` 序列长度相同。
-- cached decode 的 full-attention 层会出现 `q_len != kv_len`，还需要单独实现
-  decode kernel 或在该路径 fallback。
+- 当前验证范围是 Qwen3.5-9B text full-attention inference：
+  `causal=True`、`dtype=torch.float16`、`HEAD_DIM=256`。
+- `q_len > kv_len` 被视为非法 cache 状态。
+- masked prefill fallback 不是 fused Triton kernel，主要用于 batch padding 正确性。
 - head-dim 分块不能简单切 `HEAD_DIM` 后分别 softmax；正确实现需要两阶段算法：
   先跨 head-dim 分块累计完整 `QK^T` 的 softmax 统计量，再按 value/output
-  分块写回。这是更大的 kernel 重写；当前更小 tile + padding 已解决
-  `HEAD_DIM=256` prefill 前向。
+  分块写回。这是更大的 kernel 重写；当前更小 tile + padding + decode kernel
+  已解决 `HEAD_DIM=256` 的 Qwen3.5-9B 4bit 推理路径。
 
 ## 如何复现
 
@@ -188,10 +225,14 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=1 python /home/z/文档/triton/test_flas
   - `dtype=torch.float16`
   - `HEAD_DIM in {64, 128}`
   - `N_CTX in {128, 1024}`
+- Qwen3.5-9B text full-attention 的 `HEAD_DIM=256` 推理路径已单独验证：
+  - prefill：`BLOCK_M=16, BLOCK_N=16` + padding wrapper
+  - cached decode：本地 `_decode_attention_kernel`
+  - linear-attention：FLA `chunk` / `recurrent`
 - 还没有验证：
   - `non-causal`
   - `fp8`
-  - 更大的 `HEAD_DIM`
+  - 大于 `256` 的 `HEAD_DIM`
   - 更广泛的 batch/head 组合
 
 ## 相关文件
